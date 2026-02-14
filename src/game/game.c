@@ -33,21 +33,10 @@ static bool Tiles_Load(SDL_Renderer* r, const char* path, int tile_size)
     float tw = 0.0f, th = 0.0f;
     SDL_GetTextureSize(g_tiles_tex, &tw, &th);
 
-    if (tile_size <= 0)
-    {
-        SDL_Log("Tiles_Load: invalid tile_size=%d", tile_size);
-        return false;
-    }
-
+    if (tile_size <= 0) return false;
     g_tiles_cols = (int)(tw / (float)tile_size);
-    if (g_tiles_cols <= 0)
-    {
-        SDL_Log("Tiles_Load: tileset cols computed as %d (tex_w=%.1f, tile=%d)", g_tiles_cols, tw, tile_size);
-        return false;
-    }
 
-    SDL_Log("Tileset loaded: %s cols=%d", path, g_tiles_cols);
-    return true;
+    return (g_tiles_cols > 0);
 }
 
 static void Tiles_Unload(void)
@@ -89,7 +78,6 @@ static void Calc_Camera(const LayeredMap* m,
     float cx = focus_x - (float)win_w * 0.5f;
     float cy = focus_y - (float)win_h * 0.5f;
 
-    // Clamp to world (handles world smaller than screen too)
     if (cx < 0) cx = 0;
     if (cy < 0) cy = 0;
 
@@ -119,7 +107,7 @@ static void Move_Player_Entity(Game* g, const PlatformApp* app, double dt)
     if (Input_Down(in, SDL_SCANCODE_W) || Input_Down(in, SDL_SCANCODE_UP))    ay -= 1.0f;
     if (Input_Down(in, SDL_SCANCODE_S) || Input_Down(in, SDL_SCANCODE_DOWN))  ay += 1.0f;
 
-    // Facing
+    // facing
     if (fabsf(ax) > fabsf(ay))
     {
         if (ax < 0) g->facing = FACE_LEFT;
@@ -131,7 +119,7 @@ static void Move_Player_Entity(Game* g, const PlatformApp* app, double dt)
         else if (ay > 0) g->facing = FACE_DOWN;
     }
 
-    // Normalize so diagonals aren't faster
+    // normalize
     const float len = SDL_sqrtf(ax*ax + ay*ay);
     if (len > 0.0001f)
     {
@@ -147,19 +135,110 @@ static void Move_Player_Entity(Game* g, const PlatformApp* app, double dt)
     const float dx = ax * step;
     const float dy = ay * step;
 
-    // Tile collision + sliding
     Collision_MoveBox_Tiles(g->map, &feet, dx, dy);
 
-    // Convert feet rect back to entity origin using the same ratios
+    // back to origin
     p->x = feet.x - (float)ts * p->feet_off_x;
     p->y = feet.y - (float)ts * p->feet_off_y;
 
-    // Block against other solid entities (NPC/door)
+    // collide with other solid entities
     EntitySystem_ResolveSolids(&g->ents, p, ts);
 
-    // Keep legacy fields synced
     g->player_x = p->x;
     g->player_y = p->y;
+}
+
+// ------------------------------------------------------------
+// Door system: load map + respawn entities
+// ------------------------------------------------------------
+static bool Game_LoadMapAndRespawn(Game* g, const char* map_path, float spawn_x, float spawn_y)
+{
+    if (!g || !g->map || !map_path) return false;
+
+    // Load map into existing LayeredMap struct
+    LayeredMap_Shutdown(g->map);
+    if (!LayeredMap_LoadFromFile(g->map, map_path))
+    {
+        SDL_Log("LoadMap failed: %s", map_path);
+        return false;
+    }
+
+    SDL_strlcpy(g->current_map, map_path, sizeof(g->current_map));
+
+    // Reset systems that depend on the map
+    Interaction_Init(&g->interact);
+
+    // Rebuild entities from scratch (simple + reliable)
+    EntitySystem_Init(&g->ents);
+
+    const float ts = (float)g->map->tile_size;
+
+    // Spawn player
+    Entity* p = EntitySystem_Spawn(&g->ents, ENT_PLAYER, spawn_x, spawn_y);
+    g->player_eid = p ? p->id : 0;
+
+    if (p)
+    {
+        p->w = ts;
+        p->h = ts;
+        SDL_strlcpy(p->name, "Player", sizeof(p->name));
+        g->player_x = p->x;
+        g->player_y = p->y;
+    }
+
+    // Spawn one NPC (optional)
+    Entity* npc = EntitySystem_Spawn(&g->ents, ENT_NPC, spawn_x + ts * 2.0f, spawn_y + ts * 1.0f);
+    if (npc)
+    {
+        npc->w = ts;
+        npc->h = ts;
+        SDL_strlcpy(npc->name, "NPC", sizeof(npc->name));
+    }
+
+    // Spawn one door that returns to the other map (toggle behavior)
+    // Place it 4 tiles right / 2 tiles down from spawn
+    Entity* door = EntitySystem_Spawn(&g->ents, ENT_DOOR, spawn_x + ts * 4.0f, spawn_y + ts * 2.0f);
+    if (door)
+    {
+        door->w = ts;
+        door->h = ts;
+        SDL_strlcpy(door->name, "Door", sizeof(door->name));
+
+        // Determine opposite map for toggle
+        const char* a = "assets/maps/test.map3";
+        const char* b = "assets/maps/test2.map3";
+        const char* target = (SDL_strcmp(g->current_map, a) == 0) ? b : a;
+
+        SDL_strlcpy(door->door_target_map, target, sizeof(door->door_target_map));
+
+        // Spawn the player at a safe position in the other map
+        door->door_spawn_x = ts * 4.0f;
+        door->door_spawn_y = ts * 4.0f;
+    }
+
+    SDL_Log("Loaded map: %s (spawn %.1f,%.1f)", g->current_map, spawn_x, spawn_y);
+    return true;
+}
+
+static void Door_TryUseNearest(Game* g, PlatformApp* app)
+{
+    if (!g || !app || !g->map) return;
+
+    Entity* p = EntitySystem_FindById(&g->ents, g->player_eid);
+    if (!p) return;
+
+    // Find nearest interactable (NPC or Door), then only act if it's a Door
+    Entity* near = EntitySystem_FindNearestInteractable(&g->ents, p, g->map->tile_size, 48.0f);
+    if (!near) return;
+    if (near->type != ENT_DOOR) return;
+
+    if (near->door_target_map[0] == '\0')
+    {
+        SDL_Log("Door has no target map set");
+        return;
+    }
+
+    (void)Game_LoadMapAndRespawn(g, near->door_target_map, near->door_spawn_x, near->door_spawn_y);
 }
 
 // ------------------------------------------------------------
@@ -178,54 +257,26 @@ bool Game_Init(Game* g)
         if (!g->map) return false;
     }
 
-    if (!LayeredMap_LoadFromFile(g->map, "assets/maps/test.map3"))
+    // Default first map
+    if (g->current_map[0] == '\0')
+        SDL_strlcpy(g->current_map, "assets/maps/test.map3", sizeof(g->current_map));
+
+    // Default spawn
+    const float spawn_x = 4.0f * 16.0f; // will be corrected after map load using ts
+    const float spawn_y = 4.0f * 16.0f;
+
+    // Load map + spawn player/entities
+    // We’ll fix spawn to tile_size inside the load function by just using ts*4
+    // so pass 0/0 and let it compute after load:
+    if (!LayeredMap_LoadFromFile(g->map, g->current_map))
     {
-        SDL_Log("Game_Init: LayeredMap_LoadFromFile failed");
+        SDL_Log("Game_Init: LayeredMap_LoadFromFile failed: %s", g->current_map);
         return false;
     }
 
-    // Default spawn if unset
-    if (g->player_x == 0.0f && g->player_y == 0.0f)
-    {
-        g->player_x = (float)g->map->tile_size * 4.0f;
-        g->player_y = (float)g->map->tile_size * 4.0f;
-    }
-
-    Interaction_Init(&g->interact);
-    EntitySystem_Init(&g->ents);
-
-    // Spawn Player entity
-    Entity* p = EntitySystem_Spawn(&g->ents, ENT_PLAYER, g->player_x, g->player_y);
-    g->player_eid = p ? p->id : 0;
-
-    // Make placeholder visuals match tile size (keeps hitbox + visuals sane)
+    // Now call respawn using proper tile size spawn
     const float ts = (float)g->map->tile_size;
-    if (p)
-    {
-        p->w = ts;
-        p->h = ts;
-        SDL_strlcpy(p->name, "Player", sizeof(p->name));
-    }
-
-    // Spawn test NPC + Door
-    Entity* npc = EntitySystem_Spawn(&g->ents, ENT_NPC, g->player_x + ts * 2.0f, g->player_y + ts * 1.0f);
-    if (npc)
-    {
-        npc->w = ts;
-        npc->h = ts;
-        SDL_strlcpy(npc->name, "NPC", sizeof(npc->name));
-    }
-
-    Entity* door = EntitySystem_Spawn(&g->ents, ENT_DOOR, g->player_x + ts * 4.0f, g->player_y + ts * 2.0f);
-    if (door)
-    {
-        door->w = ts;
-        door->h = ts;
-        SDL_strlcpy(door->name, "Door", sizeof(door->name));
-    }
-
-    SDL_Log("Game_Init OK");
-    return true;
+    return Game_LoadMapAndRespawn(g, g->current_map, ts * 4.0f, ts * 4.0f);
 }
 
 void Game_Shutdown(Game* g)
@@ -248,11 +299,10 @@ void Game_FixedUpdate(Game* g, PlatformApp* app, double dt)
 {
     if (!g || !app || !g->map) return;
 
-    // IMPORTANT: must be edge-trigger (Pressed), not Down
     if (Input_Pressed(&app->input, SDL_SCANCODE_F1))
         g->debug_collision = !g->debug_collision;
 
-    // Sync from entity before interaction checks
+    // Keep legacy synced
     Entity* p = EntitySystem_FindById(&g->ents, g->player_eid);
     if (p)
     {
@@ -260,8 +310,12 @@ void Game_FixedUpdate(Game* g, PlatformApp* app, double dt)
         g->player_y = p->y;
     }
 
-    // Existing tile-based interaction
+    // Tile-based interaction (keeps your “Press E” prompt logic)
     Interaction_Update(&g->interact, app, g->map, g->player_x, g->player_y);
+
+    // E-to-use door (entity-based)
+    if (Input_Pressed(&app->input, SDL_SCANCODE_E))
+        Door_TryUseNearest(g, app);
 
     if (!Interaction_IsDialogOpen(&g->interact))
         Move_Player_Entity(g, app, dt);
@@ -275,14 +329,14 @@ void Game_Render(Game* g, PlatformApp* app)
     const LayeredMap* m = g->map;
     const int ts = m->tile_size;
 
-    // 1) ALWAYS CLEAR. This fixes "stuck between debug and not".
+    // Clear every frame (prevents “stuck debug” artifacts)
     SDL_SetRenderDrawColor(r, 0, 0, 0, 255);
     SDL_RenderClear(r);
 
     if (!g_tiles_tex)
         (void)Tiles_Load(r, "assets/tiles/tileset.png", ts);
 
-    // Camera focuses player entity
+    // Focus player
     Entity* pEnt = EntitySystem_FindById(&g->ents, g->player_eid);
     if (pEnt)
     {
@@ -293,27 +347,25 @@ void Game_Render(Game* g, PlatformApp* app)
     float cam_x = 0.0f, cam_y = 0.0f;
     Calc_Camera(m, g->player_x, g->player_y, app->win_w, app->win_h, &cam_x, &cam_y);
 
-    // Center world if it's smaller than the window
+    // Center small maps
     const float world_w = (float)(m->width * ts);
     const float world_h = (float)(m->height * ts);
-
     float off_x = 0.0f, off_y = 0.0f;
     if (world_w < (float)app->win_w) off_x = ((float)app->win_w - world_w) * 0.5f;
     if (world_h < (float)app->win_h) off_y = ((float)app->win_h - world_h) * 0.5f;
 
-    // Visible tile window
     int tx0 = (int)floorf(cam_x / (float)ts);
     int ty0 = (int)floorf(cam_y / (float)ts);
     int tx1 = (int)ceilf((cam_x + (float)app->win_w) / (float)ts) + 1;
     int ty1 = (int)ceilf((cam_y + (float)app->win_h) / (float)ts) + 1;
 
-    // 2) CLAMP to map bounds. This fixes phantom tiles/collision.
+    // Clamp to map bounds (no phantom tiles)
     if (tx0 < 0) tx0 = 0;
     if (ty0 < 0) ty0 = 0;
     if (tx1 > m->width)  tx1 = m->width;
     if (ty1 > m->height) ty1 = m->height;
 
-    // ---- ground
+    // Ground
     for (int ty = ty0; ty < ty1; ++ty)
     {
         for (int tx = tx0; tx < tx1; ++tx)
@@ -325,7 +377,7 @@ void Game_Render(Game* g, PlatformApp* app)
         }
     }
 
-    // ---- deco
+    // Deco
     for (int ty = ty0; ty < ty1; ++ty)
     {
         for (int tx = tx0; tx < tx1; ++tx)
@@ -337,8 +389,7 @@ void Game_Render(Game* g, PlatformApp* app)
         }
     }
 
-    // ---- coll placeholder (ONLY inside map, ONLY if no deco tile there)
-    // This makes your coll-only structures visible without contaminating the whole scene.
+    // Coll placeholder (coll is 0/1 only, so give it a visible wall)
     for (int ty = ty0; ty < ty1; ++ty)
     {
         for (int tx = tx0; tx < tx1; ++tx)
@@ -355,11 +406,10 @@ void Game_Render(Game* g, PlatformApp* app)
         }
     }
 
-    // ---- debug collision overlay (ONLY when enabled)
+    // Debug collision overlay
     if (g->debug_collision)
     {
         SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
-
         for (int ty = ty0; ty < ty1; ++ty)
         {
             for (int tx = tx0; tx < tx1; ++tx)
@@ -374,11 +424,10 @@ void Game_Render(Game* g, PlatformApp* app)
                 SDL_RenderFillRect(r, &rc);
             }
         }
-
         SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_NONE);
     }
 
-    // ---- entities (Y-sort)
+    // Entities (Y-sort)
     int ids[ENTITY_MAX];
     const int n = EntitySystem_BuildRenderListY(&g->ents, ids, ENTITY_MAX);
 
@@ -391,14 +440,10 @@ void Game_Render(Game* g, PlatformApp* app)
         vr.x = vr.x - cam_x + off_x;
         vr.y = vr.y - cam_y + off_y;
 
-        if (e->type == ENT_PLAYER)
-            SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
-        else if (e->type == ENT_NPC)
-            SDL_SetRenderDrawColor(r, 255, 200, 0, 255);
-        else if (e->type == ENT_DOOR)
-            SDL_SetRenderDrawColor(r, 80, 160, 255, 255);
-        else
-            SDL_SetRenderDrawColor(r, 200, 200, 200, 255);
+        if (e->type == ENT_PLAYER) SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
+        else if (e->type == ENT_NPC) SDL_SetRenderDrawColor(r, 255, 200, 0, 255);
+        else if (e->type == ENT_DOOR) SDL_SetRenderDrawColor(r, 80, 160, 255, 255);
+        else SDL_SetRenderDrawColor(r, 200, 200, 200, 255);
 
         SDL_RenderFillRect(r, &vr);
 
@@ -415,8 +460,6 @@ void Game_Render(Game* g, PlatformApp* app)
         }
     }
 
-    // ---- HUD
+    // HUD
     Interaction_RenderHUD(&g->interact, r, app->win_w, app->win_h);
-
-    // NOTE: Present is handled by your PlatformApp loop, not here.
 }

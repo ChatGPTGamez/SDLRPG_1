@@ -1,6 +1,5 @@
 // src/game/game.h
 #pragma once
-
 #include <stdbool.h>
 
 typedef struct PlatformApp PlatformApp;
@@ -19,22 +18,21 @@ typedef enum PlayerFacing
 
 typedef struct Game
 {
-    // Map
     LayeredMap* map;
 
-    // Player (kept for compatibility with existing interaction / camera / UI)
+    // Track current map path (for door toggles)
+    char current_map[128];
+
+    // Player (legacy fields kept for camera/interaction/UI)
     float player_x;
     float player_y;
     float player_speed;
     PlayerFacing facing;
 
-    // Debug
-    bool debug_collision; // F1 toggle
+    bool debug_collision;
 
-    // Interaction (your existing system)
     InteractionSystem interact;
 
-    // Entities
     EntitySystem ents;
     int player_eid;
 

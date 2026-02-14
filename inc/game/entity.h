@@ -13,8 +13,8 @@ typedef enum EntityType
 
 enum
 {
-    ENT_FLAG_SOLID        = 1 << 0, // blocks movement
-    ENT_FLAG_INTERACTABLE = 1 << 1  // can press E near it
+    ENT_FLAG_SOLID        = 1 << 0,
+    ENT_FLAG_INTERACTABLE = 1 << 1
 };
 
 typedef struct Entity
@@ -24,22 +24,22 @@ typedef struct Entity
     unsigned   flags;
     bool       alive;
 
-    // World position of the entity "origin" (same convention as your player_x/player_y)
-    float x, y;
+    float x, y;   // world origin
+    float w, h;   // visual size (placeholder)
 
-    // Visual footprint (for debug / placeholder rendering)
-    float w, h;
-
-    // Feet hitbox tuning (relative to tile size)
-    // defaults mimic the collision feet box you already used:
-    // x+0.25*ts, y+0.55*ts, w=0.50*ts, h=0.35*ts
+    // Feet hitbox ratios (relative to tile size)
     float feet_off_x;
     float feet_off_y;
     float feet_w;
     float feet_h;
 
-    // Optional label (NPC name, door name, etc.)
     char name[32];
+
+    // ---- Door data (only used when type == ENT_DOOR)
+    char  door_target_map[128];
+    float door_spawn_x;   // world coords
+    float door_spawn_y;
+
 } Entity;
 
 SDL_FRect Entity_FeetHitbox(const Entity* e, int tile_size);
