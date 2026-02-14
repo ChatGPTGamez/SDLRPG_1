@@ -10,6 +10,7 @@
 #include "platform/platform_app.h"
 #include "world/layered_map.h"
 #include "game/interaction.h"
+#include "game/collision.h"
 
 // NOTE: Interaction system is kept as a small standalone module for now.
 static InteractionSystem s_interact;
@@ -98,49 +99,41 @@ static void camera_calc(const LayeredMap* m, float px, float py,
 
 // Simple player movement (no collision resolution here — that’s a later step).
 // Also updates facing + a simple walk animation state.
-static void move_player(Game* g, const PlatformApp* app, double dt, bool* out_is_moving)
+static void move_player(Game* g, const PlatformApp* app, double dt)
 {
     const PlatformInput* in = &app->input;
 
-    float dx = 0.0f, dy = 0.0f;
-    if (Input_Down(in, SDL_SCANCODE_A) || Input_Down(in, SDL_SCANCODE_LEFT))  dx -= 1.0f;
-    if (Input_Down(in, SDL_SCANCODE_D) || Input_Down(in, SDL_SCANCODE_RIGHT)) dx += 1.0f;
-    if (Input_Down(in, SDL_SCANCODE_W) || Input_Down(in, SDL_SCANCODE_UP))    dy -= 1.0f;
-    if (Input_Down(in, SDL_SCANCODE_S) || Input_Down(in, SDL_SCANCODE_DOWN))  dy += 1.0f;
+    float ax = 0.0f, ay = 0.0f;
+    if (Input_Down(in, SDL_SCANCODE_A) || Input_Down(in, SDL_SCANCODE_LEFT))  ax -= 1.0f;
+    if (Input_Down(in, SDL_SCANCODE_D) || Input_Down(in, SDL_SCANCODE_RIGHT)) ax += 1.0f;
+    if (Input_Down(in, SDL_SCANCODE_W) || Input_Down(in, SDL_SCANCODE_UP))    ay -= 1.0f;
+    if (Input_Down(in, SDL_SCANCODE_S) || Input_Down(in, SDL_SCANCODE_DOWN))  ay += 1.0f;
 
-    bool moving = (dx != 0.0f || dy != 0.0f);
-    if (out_is_moving) *out_is_moving = moving;
-
-    // Facing: prefer the dominant axis.
-    if (moving)
-    {
-        if (fabsf(dx) > fabsf(dy))
-            g->facing = (dx < 0.0f) ? FACE_LEFT : FACE_RIGHT;
-        else
-            g->facing = (dy < 0.0f) ? FACE_UP : FACE_DOWN;
-    }
-
-    const float len = SDL_sqrtf(dx*dx + dy*dy);
+    const float len = SDL_sqrtf(ax*ax + ay*ay);
     if (len > 0.0001f)
     {
-        dx /= len;
-        dy /= len;
+        ax /= len;
+        ay /= len;
     }
 
-    const float step = g->player_speed * (float)dt;
-    g->player_x += dx * step;
-    g->player_y += dy * step;
-
-    // Clamp to map bounds (world space).
     const LayeredMap* m = g->map;
-    const float max_x = (float)(m->width  * m->tile_size - m->tile_size);
-    const float max_y = (float)(m->height * m->tile_size - m->tile_size);
+    const int ts = m->tile_size;
 
-    if (g->player_x < 0) g->player_x = 0;
-    if (g->player_y < 0) g->player_y = 0;
-    if (g->player_x > max_x) g->player_x = max_x;
-    if (g->player_y > max_y) g->player_y = max_y;
+    // Build feet hitbox from current player pos
+    SDL_FRect feet = Collision_PlayerFeetHitbox(g->player_x, g->player_y, ts);
+
+    const float step = g->player_speed * (float)dt;
+    const float dx = ax * step;
+    const float dy = ay * step;
+
+    // Move with collision + sliding
+    Collision_MoveBox_Tiles(m, &feet, dx, dy);
+
+    // Convert back to player origin so the rest of your engine stays the same
+    g->player_x = feet.x - (float)ts * 0.25f;
+    g->player_y = feet.y - (float)ts * 0.55f;
 }
+
 
 static bool load_player_sprite(Game* g, SDL_Renderer* r)
 {
@@ -258,7 +251,8 @@ void Game_FixedUpdate(Game* g, PlatformApp* app, double dt)
     if (!Interaction_IsDialogOpen(&s_interact))
     {
         bool moving = false;
-        move_player(g, app, dt, &moving);
+        //move_player(g, app, dt, &moving);
+        move_player(g, app, dt);
 
         // Simple walk animation clock: you can refine later.
         static float s_walk_t = 0.0f;
@@ -403,6 +397,19 @@ void Game_Render(Game* g, PlatformApp* app)
                 SDL_RenderFillRect(r, &rc);
             }
         }
+
+    if (g->debug_collision)
+    {
+        const int ts = m->tile_size;
+        SDL_FRect feet = Collision_PlayerFeetHitbox(g->player_x, g->player_y, ts);
+        feet.x -= cam_x;
+        feet.y -= cam_y;
+
+        SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(r, 0, 255, 0, 140);
+        SDL_RenderRect(r, &feet);
+    }
+
     }
 
     // UI overlay (prompt + message box)
