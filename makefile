@@ -61,7 +61,7 @@ CFLAGS   := $(CSTD) $(WARN) $(OPT) $(DBG) $(INCLUDES) \
 # If you installed SDL into /usr/local, these help at link/runtime.
 LDFLAGS  := -L/usr/local/lib -Wl,-rpath,/usr/local/lib -Wl,--enable-new-dtags
 
-LIBS     := $(SDL3_LIBS) $(SDL3_IMAGE_LIBS) $(SDL3_TTF_LIBS)
+LIBS     := $(SDL3_LIBS) $(SDL3_IMAGE_LIBS) $(SDL3_TTF_LIBS) -lm
 
 # ------------------------------------------------------------
 # Source discovery (recursive)
