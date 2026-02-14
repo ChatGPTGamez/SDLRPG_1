@@ -1,52 +1,56 @@
 // src/game/game.c
 #include "game/game.h"
 
+#include <math.h>
+#include <string.h>
+
 #include <SDL3/SDL.h>
 #include <SDL3_image/SDL_image.h>
 
-#include <math.h>
-#include <stdbool.h>
-
 #include "platform/platform_app.h"
 #include "world/layered_map.h"
-#include "game/interaction.h"
 #include "game/collision.h"
+#include "game/entity.h"
+#include "game/entity_system.h"
 
-// NOTE: Interaction system is kept as a small standalone module for now.
-static InteractionSystem s_interact;
-
-// Minimal tileset handling (your repo currently uses raw IMG_LoadTexture for tiles).
+// ------------------------------------------------------------
+// Tileset
+// ------------------------------------------------------------
 static SDL_Texture* g_tiles_tex = NULL;
 static int g_tiles_cols = 0;
-static int g_tiles_rows = 0;
 
-static bool load_tileset(SDL_Renderer* r, const char* path, int tile_size)
+static bool Tiles_Load(SDL_Renderer* r, const char* path, int tile_size)
 {
     if (g_tiles_tex) return true;
 
     g_tiles_tex = IMG_LoadTexture(r, path);
     if (!g_tiles_tex)
     {
-        SDL_Log("IMG_LoadTexture failed for %s : %s", path, SDL_GetError());
+        SDL_Log("IMG_LoadTexture failed: %s (%s)", path, SDL_GetError());
         return false;
     }
 
     float tw = 0.0f, th = 0.0f;
     SDL_GetTextureSize(g_tiles_tex, &tw, &th);
 
-    const int tex_w = (int)(tw + 0.5f);
-    const int tex_h = (int)(th + 0.5f);
+    if (tile_size <= 0)
+    {
+        SDL_Log("Tiles_Load: invalid tile_size=%d", tile_size);
+        return false;
+    }
 
-    g_tiles_cols = (tile_size > 0) ? (tex_w / tile_size) : 0;
-    g_tiles_rows = (tile_size > 0) ? (tex_h / tile_size) : 0;
+    g_tiles_cols = (int)(tw / (float)tile_size);
+    if (g_tiles_cols <= 0)
+    {
+        SDL_Log("Tiles_Load: tileset cols computed as %d (tex_w=%.1f, tile=%d)", g_tiles_cols, tw, tile_size);
+        return false;
+    }
 
-    SDL_SetTextureBlendMode(g_tiles_tex, SDL_BLENDMODE_BLEND);
-
-    SDL_Log("Tileset loaded: %s (%dx%d) grid=%dx%d", path, tex_w, tex_h, g_tiles_cols, g_tiles_rows);
-    return (g_tiles_cols > 0 && g_tiles_rows > 0);
+    SDL_Log("Tileset loaded: %s cols=%d", path, g_tiles_cols);
+    return true;
 }
 
-static void unload_tileset(void)
+static void Tiles_Unload(void)
 {
     if (g_tiles_tex)
     {
@@ -54,41 +58,43 @@ static void unload_tileset(void)
         g_tiles_tex = NULL;
     }
     g_tiles_cols = 0;
-    g_tiles_rows = 0;
 }
 
-static void draw_tile_1based(SDL_Renderer* r, int tile_id_1based, int tile_size, float dst_x, float dst_y)
+static void Draw_Tile(SDL_Renderer* r, int tile_id, int ts, float dx, float dy)
 {
     if (!g_tiles_tex) return;
-    if (tile_id_1based <= 0) return;
-    if (g_tiles_cols <= 0) return;
+    if (tile_id <= 0) return;
 
-    // Your map uses 1-based tile IDs; convert to 0-based index for atlas sampling.
-    const int idx = tile_id_1based - 1;
-    const int sx = (idx % g_tiles_cols) * tile_size;
-    const int sy = (idx / g_tiles_cols) * tile_size;
+    const int idx = tile_id - 1;
+    const int sx = (idx % g_tiles_cols) * ts;
+    const int sy = (idx / g_tiles_cols) * ts;
 
-    SDL_FRect src = { (float)sx, (float)sy, (float)tile_size, (float)tile_size };
-    SDL_FRect dst = { dst_x, dst_y, (float)tile_size, (float)tile_size };
+    SDL_FRect src = { (float)sx, (float)sy, (float)ts, (float)ts };
+    SDL_FRect dst = { dx, dy, (float)ts, (float)ts };
+
     SDL_RenderTexture(r, g_tiles_tex, &src, &dst);
 }
 
-// Camera clamp to map bounds.
-static void camera_calc(const LayeredMap* m, float px, float py,
-                        int screen_w, int screen_h,
+// ------------------------------------------------------------
+// Camera helper
+// ------------------------------------------------------------
+static void Calc_Camera(const LayeredMap* m,
+                        float focus_x, float focus_y,
+                        int win_w, int win_h,
                         float* out_cam_x, float* out_cam_y)
 {
     const float world_w = (float)(m->width * m->tile_size);
     const float world_h = (float)(m->height * m->tile_size);
 
-    float cx = px - (float)screen_w * 0.5f;
-    float cy = py - (float)screen_h * 0.5f;
+    float cx = focus_x - (float)win_w * 0.5f;
+    float cy = focus_y - (float)win_h * 0.5f;
 
+    // Clamp to world (handles world smaller than screen too)
     if (cx < 0) cx = 0;
     if (cy < 0) cy = 0;
 
-    const float max_x = (world_w - (float)screen_w);
-    const float max_y = (world_h - (float)screen_h);
+    const float max_x = world_w - (float)win_w;
+    const float max_y = world_h - (float)win_h;
 
     if (cx > max_x) cx = (max_x < 0) ? 0 : max_x;
     if (cy > max_y) cy = (max_y < 0) ? 0 : max_y;
@@ -97,10 +103,14 @@ static void camera_calc(const LayeredMap* m, float px, float py,
     *out_cam_y = cy;
 }
 
-// Simple player movement (no collision resolution here — that’s a later step).
-// Also updates facing + a simple walk animation state.
-static void move_player(Game* g, const PlatformApp* app, double dt)
+// ------------------------------------------------------------
+// Player movement: tile collision + sliding + entity solids
+// ------------------------------------------------------------
+static void Move_Player_Entity(Game* g, const PlatformApp* app, double dt)
 {
+    Entity* p = EntitySystem_FindById(&g->ents, g->player_eid);
+    if (!p || !g->map) return;
+
     const PlatformInput* in = &app->input;
 
     float ax = 0.0f, ay = 0.0f;
@@ -109,6 +119,19 @@ static void move_player(Game* g, const PlatformApp* app, double dt)
     if (Input_Down(in, SDL_SCANCODE_W) || Input_Down(in, SDL_SCANCODE_UP))    ay -= 1.0f;
     if (Input_Down(in, SDL_SCANCODE_S) || Input_Down(in, SDL_SCANCODE_DOWN))  ay += 1.0f;
 
+    // Facing
+    if (fabsf(ax) > fabsf(ay))
+    {
+        if (ax < 0) g->facing = FACE_LEFT;
+        else if (ax > 0) g->facing = FACE_RIGHT;
+    }
+    else
+    {
+        if (ay < 0) g->facing = FACE_UP;
+        else if (ay > 0) g->facing = FACE_DOWN;
+    }
+
+    // Normalize so diagonals aren't faster
     const float len = SDL_sqrtf(ax*ax + ay*ay);
     if (len > 0.0001f)
     {
@@ -116,101 +139,90 @@ static void move_player(Game* g, const PlatformApp* app, double dt)
         ay /= len;
     }
 
-    const LayeredMap* m = g->map;
-    const int ts = m->tile_size;
+    const int ts = g->map->tile_size;
 
-    // Build feet hitbox from current player pos
-    SDL_FRect feet = Collision_PlayerFeetHitbox(g->player_x, g->player_y, ts);
+    SDL_FRect feet = Entity_FeetHitbox(p, ts);
 
     const float step = g->player_speed * (float)dt;
     const float dx = ax * step;
     const float dy = ay * step;
 
-    // Move with collision + sliding
-    Collision_MoveBox_Tiles(m, &feet, dx, dy);
+    // Tile collision + sliding
+    Collision_MoveBox_Tiles(g->map, &feet, dx, dy);
 
-    // Convert back to player origin so the rest of your engine stays the same
-    g->player_x = feet.x - (float)ts * 0.25f;
-    g->player_y = feet.y - (float)ts * 0.55f;
+    // Convert feet rect back to entity origin using the same ratios
+    p->x = feet.x - (float)ts * p->feet_off_x;
+    p->y = feet.y - (float)ts * p->feet_off_y;
+
+    // Block against other solid entities (NPC/door)
+    EntitySystem_ResolveSolids(&g->ents, p, ts);
+
+    // Keep legacy fields synced
+    g->player_x = p->x;
+    g->player_y = p->y;
 }
 
-
-static bool load_player_sprite(Game* g, SDL_Renderer* r)
-{
-    if (g->player_tex) return true;
-
-    g->player_tex = IMG_LoadTexture(r, "assets/sprites/player.png");
-    if (!g->player_tex)
-    {
-        SDL_Log("IMG_LoadTexture failed for player sprite: %s", SDL_GetError());
-        return false;
-    }
-
-    SDL_SetTextureBlendMode(g->player_tex, SDL_BLENDMODE_BLEND);
-
-    float fw = 0.0f, fh = 0.0f;
-    SDL_GetTextureSize(g->player_tex, &fw, &fh);
-
-    g->player_tex_w = (int)(fw + 0.5f);
-    g->player_tex_h = (int)(fh + 0.5f);
-
-    // Your player.png is a classic 3x4 sheet of 32x32 frames (96x128).
-    // If you ever swap art, these 2 lines are what you’ll tweak.
-    g->player_frame_w = 32;
-    g->player_frame_h = 32;
-
-    // Draw size in world pixels: match tile size (set later once we know map tile size).
-    g->player_draw_w = 0.0f;
-    g->player_draw_h = 0.0f;
-
-    g->player_tex_ok = true;
-
-    SDL_Log("Player sprite loaded: assets/sprites/player.png (%dx%d) frame=%dx%d",
-            g->player_tex_w, g->player_tex_h, g->player_frame_w, g->player_frame_h);
-
-    return true;
-}
-
+// ------------------------------------------------------------
+// Game lifecycle
+// ------------------------------------------------------------
 bool Game_Init(Game* g)
 {
     if (!g) return false;
 
-    if (g->player_speed <= 0.0f)
-        g->player_speed = 220.0f;
+    if (g->player_speed <= 0.0f) g->player_speed = 220.0f;
+    g->debug_collision = false;
 
-    // Allocate map if not provided.
     if (!g->map)
     {
         g->map = (LayeredMap*)SDL_calloc(1, sizeof(LayeredMap));
-        if (!g->map)
-        {
-            SDL_Log("Game_Init failed: out of memory allocating LayeredMap");
-            return false;
-        }
+        if (!g->map) return false;
     }
 
-    // Load map file.
     if (!LayeredMap_LoadFromFile(g->map, "assets/maps/test.map3"))
     {
-        SDL_Log("Game_Init failed: LayeredMap_LoadFromFile assets/maps/test.map3");
+        SDL_Log("Game_Init: LayeredMap_LoadFromFile failed");
         return false;
     }
 
-    SDL_Log("Loaded map assets/maps/test.map3: %dx%d ts=%d sections: ground=1 deco=1 coll=1 interact=1",
-            g->map->width, g->map->height, g->map->tile_size);
-
-    // Default player start.
+    // Default spawn if unset
     if (g->player_x == 0.0f && g->player_y == 0.0f)
     {
-        g->player_x = 4.0f * (float)g->map->tile_size;
-        g->player_y = 4.0f * (float)g->map->tile_size;
+        g->player_x = (float)g->map->tile_size * 4.0f;
+        g->player_y = (float)g->map->tile_size * 4.0f;
     }
 
-    // Default facing.
-    if (g->facing < FACE_DOWN || g->facing > FACE_UP)
-        g->facing = FACE_DOWN;
+    Interaction_Init(&g->interact);
+    EntitySystem_Init(&g->ents);
 
-    Interaction_Init(&s_interact);
+    // Spawn Player entity
+    Entity* p = EntitySystem_Spawn(&g->ents, ENT_PLAYER, g->player_x, g->player_y);
+    g->player_eid = p ? p->id : 0;
+
+    // Make placeholder visuals match tile size (keeps hitbox + visuals sane)
+    const float ts = (float)g->map->tile_size;
+    if (p)
+    {
+        p->w = ts;
+        p->h = ts;
+        SDL_strlcpy(p->name, "Player", sizeof(p->name));
+    }
+
+    // Spawn test NPC + Door
+    Entity* npc = EntitySystem_Spawn(&g->ents, ENT_NPC, g->player_x + ts * 2.0f, g->player_y + ts * 1.0f);
+    if (npc)
+    {
+        npc->w = ts;
+        npc->h = ts;
+        SDL_strlcpy(npc->name, "NPC", sizeof(npc->name));
+    }
+
+    Entity* door = EntitySystem_Spawn(&g->ents, ENT_DOOR, g->player_x + ts * 4.0f, g->player_y + ts * 2.0f);
+    if (door)
+    {
+        door->w = ts;
+        door->h = ts;
+        SDL_strlcpy(door->name, "Door", sizeof(door->name));
+    }
 
     SDL_Log("Game_Init OK");
     return true;
@@ -220,14 +232,7 @@ void Game_Shutdown(Game* g)
 {
     if (!g) return;
 
-    unload_tileset();
-
-    if (g->player_tex)
-    {
-        SDL_DestroyTexture(g->player_tex);
-        g->player_tex = NULL;
-    }
-    g->player_tex_ok = false;
+    Tiles_Unload();
 
     if (g->map)
     {
@@ -235,30 +240,31 @@ void Game_Shutdown(Game* g)
         SDL_free(g->map);
         g->map = NULL;
     }
+
+    g->player_eid = 0;
 }
 
 void Game_FixedUpdate(Game* g, PlatformApp* app, double dt)
 {
     if (!g || !app || !g->map) return;
 
+    // IMPORTANT: must be edge-trigger (Pressed), not Down
     if (Input_Pressed(&app->input, SDL_SCANCODE_F1))
         g->debug_collision = !g->debug_collision;
 
-    // Interaction runs first (so E/Esc works even if you’re not moving).
-    Interaction_Update(&s_interact, app, g->map, g->player_x, g->player_y);
-
-    // Freeze movement while dialog is open.
-    if (!Interaction_IsDialogOpen(&s_interact))
+    // Sync from entity before interaction checks
+    Entity* p = EntitySystem_FindById(&g->ents, g->player_eid);
+    if (p)
     {
-        bool moving = false;
-        //move_player(g, app, dt, &moving);
-        move_player(g, app, dt);
-
-        // Simple walk animation clock: you can refine later.
-        static float s_walk_t = 0.0f;
-        if (moving) s_walk_t += (float)dt;
-        else s_walk_t = 0.0f;
+        g->player_x = p->x;
+        g->player_y = p->y;
     }
+
+    // Existing tile-based interaction
+    Interaction_Update(&g->interact, app, g->map, g->player_x, g->player_y);
+
+    if (!Interaction_IsDialogOpen(&g->interact))
+        Move_Player_Entity(g, app, dt);
 }
 
 void Game_Render(Game* g, PlatformApp* app)
@@ -269,120 +275,90 @@ void Game_Render(Game* g, PlatformApp* app)
     const LayeredMap* m = g->map;
     const int ts = m->tile_size;
 
-    // Lazy-load tiles + player sprite once renderer exists.
-    if (!g_tiles_tex) (void)load_tileset(r, "assets/tiles/tileset.png", ts);
-    (void)load_player_sprite(g, r);
+    // 1) ALWAYS CLEAR. This fixes "stuck between debug and not".
+    SDL_SetRenderDrawColor(r, 0, 0, 0, 255);
+    SDL_RenderClear(r);
 
-    // If we didn’t have draw size yet, match it to map tile size.
-    if (g->player_draw_w <= 0.0f) g->player_draw_w = (float)ts;
-    if (g->player_draw_h <= 0.0f) g->player_draw_h = (float)ts;
+    if (!g_tiles_tex)
+        (void)Tiles_Load(r, "assets/tiles/tileset.png", ts);
+
+    // Camera focuses player entity
+    Entity* pEnt = EntitySystem_FindById(&g->ents, g->player_eid);
+    if (pEnt)
+    {
+        g->player_x = pEnt->x;
+        g->player_y = pEnt->y;
+    }
 
     float cam_x = 0.0f, cam_y = 0.0f;
-    camera_calc(m, g->player_x, g->player_y, app->win_w, app->win_h, &cam_x, &cam_y);
+    Calc_Camera(m, g->player_x, g->player_y, app->win_w, app->win_h, &cam_x, &cam_y);
 
-    // Visible tile bounds.
-    const int tx0 = (int)floorf(cam_x / (float)ts);
-    const int ty0 = (int)floorf(cam_y / (float)ts);
-    const int tx1 = (int)ceilf((cam_x + (float)app->win_w) / (float)ts) + 1;
-    const int ty1 = (int)ceilf((cam_y + (float)app->win_h) / (float)ts) + 1;
+    // Center world if it's smaller than the window
+    const float world_w = (float)(m->width * ts);
+    const float world_h = (float)(m->height * ts);
 
-    // ---- Pass 1: ground
+    float off_x = 0.0f, off_y = 0.0f;
+    if (world_w < (float)app->win_w) off_x = ((float)app->win_w - world_w) * 0.5f;
+    if (world_h < (float)app->win_h) off_y = ((float)app->win_h - world_h) * 0.5f;
+
+    // Visible tile window
+    int tx0 = (int)floorf(cam_x / (float)ts);
+    int ty0 = (int)floorf(cam_y / (float)ts);
+    int tx1 = (int)ceilf((cam_x + (float)app->win_w) / (float)ts) + 1;
+    int ty1 = (int)ceilf((cam_y + (float)app->win_h) / (float)ts) + 1;
+
+    // 2) CLAMP to map bounds. This fixes phantom tiles/collision.
+    if (tx0 < 0) tx0 = 0;
+    if (ty0 < 0) ty0 = 0;
+    if (tx1 > m->width)  tx1 = m->width;
+    if (ty1 > m->height) ty1 = m->height;
+
+    // ---- ground
     for (int ty = ty0; ty < ty1; ++ty)
     {
         for (int tx = tx0; tx < tx1; ++tx)
         {
             const int gid = LayeredMap_Ground(m, tx, ty);
-            const float dx = (float)(tx * ts) - cam_x;
-            const float dy = (float)(ty * ts) - cam_y;
-            draw_tile_1based(r, gid, ts, dx, dy);
+            const float dx = (float)(tx * ts) - cam_x + off_x;
+            const float dy = (float)(ty * ts) - cam_y + off_y;
+            Draw_Tile(r, gid, ts, dx, dy);
         }
     }
 
-    // ---- Pass 2: deco tiles that are "behind" the player by Y (simple depth)
-    // Rule: if the tile’s bottom edge is <= player feet Y, draw it before player.
-    const float player_feet_y = g->player_y + g->player_draw_h * 0.85f;
-
+    // ---- deco
     for (int ty = ty0; ty < ty1; ++ty)
     {
         for (int tx = tx0; tx < tx1; ++tx)
         {
             const int did = LayeredMap_Deco(m, tx, ty);
-            if (did <= 0) continue;
-
-            const float tile_bottom_y = (float)((ty + 1) * ts);
-            if (tile_bottom_y > player_feet_y) continue;
-
-            const float dx = (float)(tx * ts) - cam_x;
-            const float dy = (float)(ty * ts) - cam_y;
-            draw_tile_1based(r, did, ts, dx, dy);
+            const float dx = (float)(tx * ts) - cam_x + off_x;
+            const float dy = (float)(ty * ts) - cam_y + off_y;
+            Draw_Tile(r, did, ts, dx, dy);
         }
     }
 
-    // ---- Player sprite
-    if (g->player_tex)
-    {
-        // 3 columns (idle/walk1/walk2), 4 rows (down/left/right/up)
-        // Walking animation based on a small timer derived from position.
-        // (Cheap, deterministic, and good enough for now.)
-        int col = 0;
-        {
-            const float wobble = fabsf(sinf((g->player_x + g->player_y) * 0.02f));
-            col = (wobble > 0.66f) ? 2 : (wobble > 0.33f) ? 1 : 0;
-        }
-
-        int row = 0;
-        switch (g->facing)
-        {
-            case FACE_DOWN:  row = 0; break;
-            case FACE_LEFT:  row = 1; break;
-            case FACE_RIGHT: row = 2; break;
-            case FACE_UP:    row = 3; break;
-            default:         row = 0; break;
-        }
-
-        SDL_FRect src = {
-            (float)(col * g->player_frame_w),
-            (float)(row * g->player_frame_h),
-            (float)g->player_frame_w,
-            (float)g->player_frame_h
-        };
-
-        // World -> screen (camera)
-        const float px = g->player_x - cam_x;
-        const float py = g->player_y - cam_y;
-
-        SDL_FRect dst = {
-            px,
-            py,
-            g->player_draw_w,
-            g->player_draw_h
-        };
-
-        SDL_RenderTexture(r, g->player_tex, &src, &dst);
-    }
-
-    // ---- Pass 3: deco tiles that are "in front" of the player
+    // ---- coll placeholder (ONLY inside map, ONLY if no deco tile there)
+    // This makes your coll-only structures visible without contaminating the whole scene.
     for (int ty = ty0; ty < ty1; ++ty)
     {
         for (int tx = tx0; tx < tx1; ++tx)
         {
-            const int did = LayeredMap_Deco(m, tx, ty);
-            if (did <= 0) continue;
+            if (!LayeredMap_Solid(m, tx, ty)) continue;
+            if (LayeredMap_Deco(m, tx, ty) != 0) continue;
 
-            const float tile_bottom_y = (float)((ty + 1) * ts);
-            if (tile_bottom_y <= player_feet_y) continue;
+            const float dx = (float)(tx * ts) - cam_x + off_x;
+            const float dy = (float)(ty * ts) - cam_y + off_y;
 
-            const float dx = (float)(tx * ts) - cam_x;
-            const float dy = (float)(ty * ts) - cam_y;
-            draw_tile_1based(r, did, ts, dx, dy);
+            SDL_FRect rc = { dx, dy, (float)ts, (float)ts };
+            SDL_SetRenderDrawColor(r, 70, 70, 90, 255);
+            SDL_RenderFillRect(r, &rc);
         }
     }
 
-    // Optional collision debug overlay
+    // ---- debug collision overlay (ONLY when enabled)
     if (g->debug_collision)
     {
         SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
-        SDL_SetRenderDrawColor(r, 255, 0, 0, 90);
 
         for (int ty = ty0; ty < ty1; ++ty)
         {
@@ -390,28 +366,57 @@ void Game_Render(Game* g, PlatformApp* app)
             {
                 if (!LayeredMap_Solid(m, tx, ty)) continue;
 
-                const float dx = (float)(tx * ts) - cam_x;
-                const float dy = (float)(ty * ts) - cam_y;
+                const float dx = (float)(tx * ts) - cam_x + off_x;
+                const float dy = (float)(ty * ts) - cam_y + off_y;
 
                 SDL_FRect rc = { dx, dy, (float)ts, (float)ts };
+                SDL_SetRenderDrawColor(r, 255, 0, 0, 70);
                 SDL_RenderFillRect(r, &rc);
             }
         }
 
-    if (g->debug_collision)
+        SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_NONE);
+    }
+
+    // ---- entities (Y-sort)
+    int ids[ENTITY_MAX];
+    const int n = EntitySystem_BuildRenderListY(&g->ents, ids, ENTITY_MAX);
+
+    for (int i = 0; i < n; ++i)
     {
-        const int ts = m->tile_size;
-        SDL_FRect feet = Collision_PlayerFeetHitbox(g->player_x, g->player_y, ts);
-        feet.x -= cam_x;
-        feet.y -= cam_y;
+        Entity* e = EntitySystem_FindById(&g->ents, ids[i]);
+        if (!e) continue;
 
-        SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
-        SDL_SetRenderDrawColor(r, 0, 255, 0, 140);
-        SDL_RenderRect(r, &feet);
+        SDL_FRect vr = Entity_VisualRect(e);
+        vr.x = vr.x - cam_x + off_x;
+        vr.y = vr.y - cam_y + off_y;
+
+        if (e->type == ENT_PLAYER)
+            SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
+        else if (e->type == ENT_NPC)
+            SDL_SetRenderDrawColor(r, 255, 200, 0, 255);
+        else if (e->type == ENT_DOOR)
+            SDL_SetRenderDrawColor(r, 80, 160, 255, 255);
+        else
+            SDL_SetRenderDrawColor(r, 200, 200, 200, 255);
+
+        SDL_RenderFillRect(r, &vr);
+
+        if (g->debug_collision)
+        {
+            SDL_FRect feet = Entity_FeetHitbox(e, ts);
+            feet.x = feet.x - cam_x + off_x;
+            feet.y = feet.y - cam_y + off_y;
+
+            SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+            SDL_SetRenderDrawColor(r, 0, 255, 0, 160);
+            SDL_RenderRect(r, &feet);
+            SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_NONE);
+        }
     }
 
-    }
+    // ---- HUD
+    Interaction_RenderHUD(&g->interact, r, app->win_w, app->win_h);
 
-    // UI overlay (prompt + message box)
-    Interaction_RenderHUD(&s_interact, r, app->win_w, app->win_h);
+    // NOTE: Present is handled by your PlatformApp loop, not here.
 }
