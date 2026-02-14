@@ -9,6 +9,7 @@ typedef struct Tileset Tileset;
 typedef struct SDL_Texture SDL_Texture;
 
 #include "../ui/message_box.h"
+#include "game/interaction.h"
 
 typedef enum PlayerFacing
 {

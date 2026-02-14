@@ -1,71 +1,73 @@
-// src/ui/message_box.c
-#include "message_box.h"
-#include "ui_text.h"
+#include "ui/message_box.h"
+#include "ui/ui_text.h"
 
 #include <SDL3/SDL.h>
 #include <string.h>
 
-void MessageBox_Init(MessageBox* mb)
+void MessageBox_Open(MessageBox* mb, const char* text)
 {
     if (!mb) return;
-    mb->visible = false;
+    mb->open = true;
     mb->text[0] = '\0';
+    if (text)
+    {
+        strncpy(mb->text, text, sizeof(mb->text) - 1);
+        mb->text[sizeof(mb->text) - 1] = '\0';
+    }
 }
 
-void MessageBox_Show(MessageBox* mb, const char* text)
+void MessageBox_Close(MessageBox* mb)
 {
     if (!mb) return;
-    mb->visible = true;
-    if (text) SDL_strlcpy(mb->text, text, sizeof(mb->text));
-    else mb->text[0] = '\0';
+    mb->open = false;
 }
 
-void MessageBox_Hide(MessageBox* mb)
+bool MessageBox_IsOpen(const MessageBox* mb)
 {
-    if (!mb) return;
-    mb->visible = false;
+    return mb && mb->open;
 }
 
-void MessageBox_Toggle(MessageBox* mb)
+static void fill(SDL_Renderer* r, SDL_FRect rc, Uint8 rr, Uint8 gg, Uint8 bb, Uint8 aa)
 {
-    if (!mb) return;
-    mb->visible = !mb->visible;
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(r, rr, gg, bb, aa);
+    SDL_RenderFillRect(r, &rc);
 }
 
-void MessageBox_Render(const MessageBox* mb, void* sdl_renderer, int screen_w, int screen_h)
+static void outline(SDL_Renderer* r, SDL_FRect rc, Uint8 rr, Uint8 gg, Uint8 bb, Uint8 aa)
 {
-    if (!mb || !mb->visible) return;
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(r, rr, gg, bb, aa);
+    SDL_RenderRect(r, &rc);
+}
 
-    SDL_Renderer* r = (SDL_Renderer*)sdl_renderer;
+void MessageBox_Render(MessageBox* mb, SDL_Renderer* r, int screen_w, int screen_h)
+{
+    if (!mb || !mb->open) return;
 
-    // Ensure text system is ready (safe to call every frame)
     (void)UIText_Init(r);
 
-    const float pad = 24.0f;
-    const float h = 150.0f;
-    SDL_FRect box = { pad, (float)screen_h - h - pad, (float)screen_w - pad * 2.0f, h };
+    const float pad = 18.0f;
+    const float box_h = 150.0f;
 
-    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+    SDL_FRect dim = { 0, 0, (float)screen_w, (float)screen_h };
+    fill(r, dim, 0, 0, 0, 90);
 
-    // backdrop
-    SDL_SetRenderDrawColor(r, 0, 0, 0, 215);
-    SDL_RenderFillRect(r, &box);
+    SDL_FRect box = {
+        pad,
+        (float)screen_h - box_h - pad,
+        (float)screen_w - pad * 2.0f,
+        box_h
+    };
 
-    // border
-    SDL_SetRenderDrawColor(r, 255, 255, 255, 90);
-    SDL_RenderRect(r, &box);
+    fill(r, box, 10, 10, 12, 215);
+    outline(r, box, 200, 200, 200, 180);
 
-    // Message text
     const float tx = box.x + 18.0f;
     const float ty = box.y + 18.0f;
 
     if (mb->text[0])
         UIText_DrawLine(r, tx, ty, mb->text);
-    else
-        UIText_DrawLine(r, tx, ty, "(no message)");
 
-    // Close hint
-    UIText_DrawLine(r, tx, box.y + box.h - 34.0f, "Press E or ESC to close");
-
-    // Leave blend mode as-is; this is fine for the rest of the frame.
+    UIText_DrawLine(r, tx, box.y + box.h - 34.0f, "E / Esc: Close");
 }

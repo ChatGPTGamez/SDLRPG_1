@@ -1,5 +1,4 @@
-// src/ui/ui_text.c
-#include "ui_text.h"
+#include "ui/ui_text.h"
 
 #include <SDL3/SDL.h>
 #include <SDL3_ttf/SDL_ttf.h>
@@ -60,9 +59,10 @@ bool UIText_MeasureLine(const char* text, int* out_w, int* out_h)
 {
     if (!g_font || !text || !text[0]) return false;
 
-    // SDL3_ttf removed TTF_SizeText; measure by rendering a surface and reading w/h.
     SDL_Color fg = { 255, 255, 255, 255 };
-    SDL_Surface* s = TTF_RenderText_Blended(g_font, text, 0, fg); // length=0 => null-terminated
+
+    // length=0 => null-terminated (SDL3_ttf)
+    SDL_Surface* s = TTF_RenderText_Blended(g_font, text, 0, fg);
     if (!s) return false;
 
     if (out_w) *out_w = s->w;
@@ -79,7 +79,6 @@ bool UIText_DrawLine(SDL_Renderer* renderer, float x, float y, const char* text)
 
     SDL_Color fg = { 240, 240, 240, 255 };
 
-    // length=0 => null-terminated (SDL3_ttf API)
     SDL_Surface* s = TTF_RenderText_Blended(g_font, text, 0, fg);
     if (!s)
     {
@@ -92,7 +91,7 @@ bool UIText_DrawLine(SDL_Renderer* renderer, float x, float y, const char* text)
 
     if (!t)
     {
-        SDL_Log("CreateTextureFromSurface failed: %s", SDL_GetError());
+        SDL_Log("SDL_CreateTextureFromSurface failed: %s", SDL_GetError());
         return false;
     }
 
