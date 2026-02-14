@@ -1,0 +1,18 @@
+# Build output
+build/
+rpg_engine
+*.o
+*.d
+
+# Core dumps
+core
+core.*
+
+# Editor junk
+*.swp
+*.swo
+*.tmp
+
+# OS junk
+.DS_Store
+Thumbs.db
